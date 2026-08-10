@@ -1,19 +1,16 @@
 use std::io::Write;
 
-use syncvar::{Registry, RegistryLabel};
+use syncvar::Registry;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let registry = Registry::<String>::default().await;
-    let var = registry
-        .set(String::new(), RegistryLabel::NUMBER(1))
-        .await?;
+    env_logger::init();
 
-    println!(
-        "serving variable id=1 at http://{}/data?id=1",
-        registry.addr()
-    );
+    let registry = Registry::default().await?;
+    let var = registry.set(String::new(), 1usize).await?;
+
+    println!("serving variable id=1 at http://{}/data?id=1", registry.addr());
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
