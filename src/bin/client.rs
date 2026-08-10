@@ -4,7 +4,7 @@ use syncvar::{RegistryLabel, SyncedVar};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let var = SyncedVar::default(RegistryLabel::NUMBER(1)).await?;
+    let var = SyncedVar::<String>::default(RegistryLabel::NUMBER(1)).await?;
 
     loop {
         println!("{}", var.get());

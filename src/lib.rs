@@ -5,7 +5,15 @@ use std::sync::{Arc, Weak};
 use axum::extract::{Query, State};
 use axum::response::sse::{Event, Sse};
 use axum::{Router, routing::get};
+use base64::Engine as _;
+use base64::prelude::BASE64_STANDARD;
 use eventsource_stream::Eventsource;
+use rkyv::api::high::{HighDeserializer, HighSerializer, HighValidator};
+use rkyv::bytecheck::CheckBytes;
+use rkyv::rancor;
+use rkyv::ser::allocator::ArenaHandle;
+use rkyv::util::AlignedVec;
+use rkyv::{Archive, Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, watch};
 use tokio::task::JoinHandle;
@@ -14,42 +22,73 @@ use tokio_stream::{Stream, StreamExt};
 
 pub const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6613);
 
+/// A synced value: shareable across tasks and rkyv round-trippable over the wire.
+pub trait Value: Default + Clone + Send + Sync + 'static {
+    fn encode(&self) -> String;
+    fn decode(data: &str) -> Option<Self>
+    where
+        Self: Sized;
+}
+
+impl<T> Value for T
+where
+    T: Default
+        + Clone
+        + Send
+        + Sync
+        + 'static
+        + Archive
+        + for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>>,
+    T::Archived: for<'a> CheckBytes<HighValidator<'a, rancor::Error>>
+        + Deserialize<T, HighDeserializer<rancor::Error>>,
+{
+    fn encode(&self) -> String {
+        BASE64_STANDARD.encode(rkyv::to_bytes::<rancor::Error>(self).unwrap())
+    }
+
+    fn decode(data: &str) -> Option<Self> {
+        let bytes = BASE64_STANDARD.decode(data).ok()?;
+        let mut aligned = AlignedVec::<16>::new();
+        aligned.extend_from_slice(&bytes);
+        rkyv::from_bytes::<T, rancor::Error>(&aligned).ok()
+    }
+}
+
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub enum RegistryLabel {
     TEXT(String),
     NUMBER(usize),
 }
 
-pub type Val = String;
-pub struct SyncedVarSource {
-    tx: watch::Sender<Val>,
+pub struct SyncedVarSource<T> {
+    tx: watch::Sender<T>,
 }
 
-impl SyncedVarSource {
-    fn new(val: Val) -> Self {
+impl<T: Value> SyncedVarSource<T> {
+    fn new(val: T) -> Self {
         let (tx, _) = watch::channel(val);
         SyncedVarSource { tx }
     }
 
-    pub fn get(&self) -> Val {
+    pub fn get(&self) -> T {
         self.tx.borrow().clone()
     }
 
-    pub fn set(&self, val: Val) {
+    pub fn set(&self, val: T) {
         self.tx.send_replace(val);
     }
 
-    fn subscribe(&self) -> watch::Receiver<Val> {
+    fn subscribe(&self) -> watch::Receiver<T> {
         self.tx.subscribe()
     }
 }
 
-pub struct SyncedVar {
-    value: watch::Receiver<Val>,
+pub struct SyncedVar<T> {
+    value: watch::Receiver<T>,
     task: JoinHandle<()>,
 }
 
-impl SyncedVar {
+impl<T: Value> SyncedVar<T> {
     pub async fn new(source: SocketAddr, id: RegistryLabel) -> reqwest::Result<Self> {
         let query = match id {
             RegistryLabel::NUMBER(n) => ("id", n.to_string()),
@@ -61,11 +100,13 @@ impl SyncedVar {
             .send()
             .await?
             .error_for_status()?;
-        let (tx, value) = watch::channel(Val::new());
+        let (tx, value) = watch::channel(T::default());
         let task = tokio::spawn(async move {
             let mut events = Box::pin(resp.bytes_stream().eventsource());
             while let Some(Ok(event)) = events.next().await {
-                tx.send_replace(event.data);
+                if let Some(val) = T::decode(&event.data) {
+                    tx.send_replace(val);
+                }
             }
         });
         Ok(SyncedVar { value, task })
@@ -75,18 +116,18 @@ impl SyncedVar {
         SyncedVar::new(DEFAULT_ADDR, id).await
     }
 
-    pub fn get(&self) -> Val {
+    pub fn get(&self) -> T {
         self.value.borrow().clone()
     }
 }
 
-impl Drop for SyncedVar {
+impl<T> Drop for SyncedVar<T> {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
-type Vars = Arc<RwLock<HashMap<RegistryLabel, Weak<SyncedVarSource>>>>;
+type Vars<T> = Arc<RwLock<HashMap<RegistryLabel, Weak<SyncedVarSource<T>>>>>;
 
 #[derive(Debug, PartialEq)]
 pub enum SetError {
@@ -103,19 +144,19 @@ impl std::fmt::Display for SetError {
 
 impl std::error::Error for SetError {}
 
-pub struct Registry {
-    vars: Vars,
+pub struct Registry<T> {
+    vars: Vars<T>,
     server: JoinHandle<()>,
     addr: SocketAddr,
 }
 
-impl Registry {
+impl<T: Value> Registry<T> {
     pub async fn new(source: SocketAddr) -> Self {
-        let vars: Vars = Arc::new(RwLock::new(HashMap::new()));
+        let vars: Vars<T> = Arc::new(RwLock::new(HashMap::new()));
         let listener = TcpListener::bind(source).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = Router::new()
-            .route("/data", get(data))
+            .route("/data", get(data::<T>))
             .with_state(vars.clone());
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -131,7 +172,11 @@ impl Registry {
         self.addr
     }
 
-    pub async fn set(&self, val: Val, id: RegistryLabel) -> Result<Arc<SyncedVarSource>, SetError> {
+    pub async fn set(
+        &self,
+        val: T,
+        id: RegistryLabel,
+    ) -> Result<Arc<SyncedVarSource<T>>, SetError> {
         let mut vars = self.vars.write().await;
         if vars.get(&id).and_then(Weak::upgrade).is_some() {
             return Err(SetError::IdTaken);
@@ -158,8 +203,8 @@ impl DataParams {
     }
 }
 
-async fn data(
-    State(vars): State<Vars>,
+async fn data<T: Value>(
+    State(vars): State<Vars<T>>,
     Query(params): Query<DataParams>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = match params.label() {
@@ -171,8 +216,8 @@ async fn data(
             .map(|v| v.subscribe()),
         None => None,
     };
-    let rx = rx.unwrap_or_else(|| watch::channel(Val::new()).1);
-    let stream = WatchStream::from_changes(rx).map(|val| Ok(Event::default().data(val)));
+    let rx = rx.unwrap_or_else(|| watch::channel(T::default()).1);
+    let stream = WatchStream::from_changes(rx).map(|val| Ok(Event::default().data(val.encode())));
     Sse::new(stream)
 }
 
@@ -247,6 +292,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         v2.set("other2".to_string());
         v1.set("world".to_string());
+        let world_enc = "world".to_string().encode();
+        let other_enc = "other2".to_string().encode();
 
         let mut resp = String::new();
         loop {
@@ -257,14 +304,14 @@ mod tests {
                 .unwrap();
             assert!(n > 0, "connection closed before event: {resp}");
             resp.push_str(&String::from_utf8_lossy(&buf[..n]));
-            if resp.contains("data: world") {
+            if resp.contains(&world_enc) {
                 break;
             }
         }
         registry.server.abort();
 
         assert!(resp.contains("content-type: text/event-stream"));
-        assert!(!resp.contains("data: other2"));
+        assert!(!resp.contains(&other_enc));
     }
 
     #[tokio::test]
@@ -298,5 +345,41 @@ mod tests {
         registry.server.abort();
 
         assert_eq!(reused.get(), "second");
+    }
+
+    #[tokio::test]
+    async fn syncs_non_string_value() {
+        use std::time::Duration;
+
+        #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Default, Debug, PartialEq)]
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+
+        let registry = Registry::<Point>::new(loopback()).await;
+        let source = registry
+            .set(Point::default(), RegistryLabel::NUMBER(1))
+            .await
+            .unwrap();
+
+        let var = SyncedVar::<Point>::new(registry.addr, RegistryLabel::NUMBER(1))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        source.set(Point { x: 3, y: 7 });
+
+        let mut got = Point::default();
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            got = var.get();
+            if got == (Point { x: 3, y: 7 }) {
+                break;
+            }
+        }
+        registry.server.abort();
+
+        assert_eq!(got, Point { x: 3, y: 7 });
     }
 }
