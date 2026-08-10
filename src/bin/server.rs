@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use syncvar::Registry;
+use syncvar::server::Registry;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[tokio::main]

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use syncvar::SyncedVar;
+use syncvar::client::SyncedVar;
 
 #[tokio::main]
 async fn main() {
