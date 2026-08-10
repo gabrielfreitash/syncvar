@@ -1,0 +1,12 @@
+[package]
+name = "syncvar"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.9"
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "sync", "net", "io-util", "io-std", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+serde = { version = "1", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream"] }
+eventsource-stream = "0.2"
