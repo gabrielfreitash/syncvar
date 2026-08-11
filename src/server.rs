@@ -6,10 +6,13 @@ use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Query, State};
-use axum::http::header::CONTENT_TYPE;
-use axum::response::IntoResponse;
+use axum::extract::{Query, Request, State};
+use axum::http::StatusCode;
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::{Router, routing::get};
+use axum_server::tls_rustls::RustlsConfig;
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, watch};
 use tokio::task::JoinHandle;
@@ -81,19 +84,109 @@ pub struct Registry {
     addr: SocketAddr,
 }
 
+/// TLS options for a [`Registry`].
+pub enum Tls {
+    /// Generate an in-memory self-signed certificate valid for the given DNS names / IP
+    /// addresses. Clients must trust it out-of-band or set
+    /// [`ClientConfig::danger_accept_invalid_certs`](crate::client::ClientConfig::danger_accept_invalid_certs).
+    SelfSigned { subject_alt_names: Vec<String> },
+    /// Serve with a caller-provided PEM certificate chain and private key.
+    Pem { cert: Vec<u8>, key: Vec<u8> },
+}
+
+impl Tls {
+    /// Self-signed certificate covering `localhost` and `127.0.0.1`.
+    pub fn self_signed_localhost() -> Self {
+        Tls::SelfSigned {
+            subject_alt_names: vec!["localhost".to_string(), "127.0.0.1".to_string()],
+        }
+    }
+
+    /// Resolves to a PEM certificate chain and private key, generating one if needed.
+    fn into_pem(self) -> Result<(Vec<u8>, Vec<u8>), rcgen::Error> {
+        match self {
+            Tls::SelfSigned { subject_alt_names } => {
+                let generated = rcgen::generate_simple_self_signed(subject_alt_names)?;
+                Ok((
+                    generated.cert.pem().into_bytes(),
+                    generated.signing_key.serialize_pem().into_bytes(),
+                ))
+            }
+            Tls::Pem { cert, key } => Ok((cert, key)),
+        }
+    }
+}
+
+/// Server-side options for a [`Registry`].
+pub struct ServerConfig {
+    /// Require `Authorization: Bearer <token>` on every request. `None` disables auth.
+    pub auth_token: Option<String>,
+    /// Serve over HTTPS with the given TLS configuration. `None` serves plain HTTP.
+    pub tls: Option<Tls>,
+}
+
+impl Default for ServerConfig {
+    /// TLS on with a self-signed `localhost` certificate and no auth token.
+    fn default() -> Self {
+        ServerConfig {
+            auth_token: None,
+            tls: Some(Tls::self_signed_localhost()),
+        }
+    }
+}
+
 impl Registry {
     pub async fn new(addr: SocketAddr) -> io::Result<Self> {
+        Registry::with_config(addr, ServerConfig::default()).await
+    }
+
+    /// Like [`new`](Self::new) but requires callers to present `Authorization: Bearer <token>`.
+    pub async fn with_auth(addr: SocketAddr, token: impl Into<String>) -> io::Result<Self> {
+        let config = ServerConfig {
+            auth_token: Some(token.into()),
+            ..ServerConfig::default()
+        };
+        Registry::with_config(addr, config).await
+    }
+
+    /// Builds a registry with explicit auth and TLS options.
+    pub async fn with_config(addr: SocketAddr, config: ServerConfig) -> io::Result<Self> {
+        let ServerConfig { auth_token, tls } = config;
         let vars: Vars = Arc::new(RwLock::new(HashMap::new()));
-        let listener = TcpListener::bind(addr).await?;
+        let listener = std::net::TcpListener::bind(addr)?;
+        listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
-        let app = Router::new()
+
+        let mut app = Router::new()
             .route("/data", get(data))
             .with_state(vars.clone());
-        let server = tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
-                log::error!("registry server stopped: {e}");
+        if let Some(token) = auth_token {
+            let token: Arc<str> = Arc::from(token);
+            app = app.layer(middleware::from_fn_with_state(token, require_auth));
+        }
+
+        let server = match tls {
+            Some(tls) => {
+                let (cert, key) = tls.into_pem().map_err(io::Error::other)?;
+                crate::install_crypto_provider();
+                let tls_config = RustlsConfig::from_pem(cert, key).await?;
+                let server = axum_server::from_tcp_rustls(listener, tls_config)?;
+                let make = app.into_make_service();
+                tokio::spawn(async move {
+                    if let Err(e) = server.serve(make).await {
+                        log::error!("registry server stopped: {e}");
+                    }
+                })
             }
-        });
+            None => {
+                let listener = TcpListener::from_std(listener)?;
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(listener, app).await {
+                        log::error!("registry server stopped: {e}");
+                    }
+                })
+            }
+        };
         Ok(Registry { vars, server, addr })
     }
 
@@ -155,12 +248,33 @@ async fn data(State(vars): State<Vars>, Query(params): Query<DataParams>) -> imp
     };
     let stream: Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>> = match source {
         Some(src) => Box::pin(src.encoded_stream().map(|payload| Ok(frame(payload)))),
-        None => Box::pin(tokio_stream::iter(std::iter::empty::<Result<Bytes, Infallible>>())),
+        None => Box::pin(tokio_stream::iter(std::iter::empty::<
+            Result<Bytes, Infallible>,
+        >())),
     };
     (
         [(CONTENT_TYPE, "application/octet-stream")],
         Body::from_stream(stream),
     )
+}
+
+/// Rejects requests lacking a matching `Authorization: Bearer <token>` header.
+async fn require_auth(
+    State(token): State<Arc<str>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let authorized = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|t| t == &*token);
+    if authorized {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
 }
 
 /// Wraps a payload as a length-prefixed frame (`u32` LE length + payload).

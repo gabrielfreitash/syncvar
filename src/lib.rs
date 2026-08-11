@@ -12,6 +12,23 @@ pub mod server;
 
 pub const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6613);
 
+/// Installs the ring TLS crypto provider as the process default, once per process.
+///
+/// Both the server (serving over rustls) and the client (reqwest's rustls backend) rely on a
+/// process-default [`CryptoProvider`](rustls::crypto::CryptoProvider); this sets it. A no-op if
+/// one is already installed.
+pub(crate) fn install_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if rustls::crypto::ring::default_provider()
+            .install_default()
+            .is_err()
+        {
+            log::debug!("rustls crypto provider already installed");
+        }
+    });
+}
+
 /// A value that can be synced: shareable across tasks and rkyv round-trippable over the wire.
 ///
 /// Blanket-implemented for any `Clone + Send + Sync + 'static` type deriving rkyv's
@@ -86,8 +103,8 @@ mod tests {
     use std::time::Duration;
 
     use super::Value;
-    use crate::client::SyncedVar;
-    use crate::server::{Registry, SetError};
+    use crate::client::{ClientConfig, SyncedVar};
+    use crate::server::{Registry, ServerConfig, SetError, Tls};
 
     fn loopback() -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], 0))
@@ -210,5 +227,113 @@ mod tests {
         let registry = Registry::new(addr).await.unwrap();
         let _source = registry.set("second".to_string(), 1usize).await.unwrap();
         eventually(&var, &Some("second".to_string())).await;
+    }
+
+    #[tokio::test]
+    async fn auth_allows_matching_token() {
+        let registry = Registry::with_auth(loopback(), "secret").await.unwrap();
+        let _source = registry.set("guarded".to_string(), 1usize).await.unwrap();
+
+        let config = ClientConfig {
+            auth_token: Some("secret".to_string()),
+            ..Default::default()
+        };
+        let var = SyncedVar::<String>::with_config(registry.addr(), 1usize, config);
+        eventually(&var, &Some("guarded".to_string())).await;
+    }
+
+    #[tokio::test]
+    async fn auth_rejects_missing_token() {
+        let registry = Registry::with_auth(loopback(), "secret").await.unwrap();
+        let _source = registry.set("guarded".to_string(), 1usize).await.unwrap();
+
+        let var = SyncedVar::<String>::new(registry.addr(), 1usize);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(var.get(), None);
+    }
+
+    #[tokio::test]
+    async fn auth_rejects_wrong_token() {
+        let registry = Registry::with_auth(loopback(), "secret").await.unwrap();
+        let _source = registry.set("guarded".to_string(), 1usize).await.unwrap();
+
+        let config = ClientConfig {
+            auth_token: Some("nope".to_string()),
+            ..Default::default()
+        };
+        let var = SyncedVar::<String>::with_config(registry.addr(), 1usize, config);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(var.get(), None);
+    }
+
+    #[tokio::test]
+    async fn self_signed_tls_syncs() {
+        let config = ServerConfig {
+            tls: Some(Tls::self_signed_localhost()),
+            ..Default::default()
+        };
+        let registry = Registry::with_config(loopback(), config).await.unwrap();
+        let _source = registry.set("secure".to_string(), 1usize).await.unwrap();
+
+        let client = ClientConfig {
+            tls: true,
+            danger_accept_invalid_certs: true,
+            ..Default::default()
+        };
+        let var = SyncedVar::<String>::with_config(registry.addr(), 1usize, client);
+        eventually(&var, &Some("secure".to_string())).await;
+    }
+
+    #[tokio::test]
+    async fn tls_rejects_untrusted_cert_when_verifying() {
+        let config = ServerConfig {
+            tls: Some(Tls::self_signed_localhost()),
+            ..Default::default()
+        };
+        let registry = Registry::with_config(loopback(), config).await.unwrap();
+        let _source = registry.set("secure".to_string(), 1usize).await.unwrap();
+
+        let client = ClientConfig {
+            tls: true,
+            danger_accept_invalid_certs: false,
+            ..Default::default()
+        };
+        let var = SyncedVar::<String>::with_config(registry.addr(), 1usize, client);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(var.get(), None);
+    }
+
+    #[tokio::test]
+    async fn tls_with_auth_syncs() {
+        let config = ServerConfig {
+            auth_token: Some("secret".to_string()),
+            tls: Some(Tls::self_signed_localhost()),
+        };
+        let registry = Registry::with_config(loopback(), config).await.unwrap();
+        let _source = registry.set("both".to_string(), 1usize).await.unwrap();
+
+        let client = ClientConfig {
+            auth_token: Some("secret".to_string()),
+            tls: true,
+            danger_accept_invalid_certs: true,
+        };
+        let var = SyncedVar::<String>::with_config(registry.addr(), 1usize, client);
+        eventually(&var, &Some("both".to_string())).await;
+    }
+
+    #[tokio::test]
+    async fn default_config_uses_self_signed_tls() {
+        assert!(ServerConfig::default().tls.is_some());
+        assert!(ServerConfig::default().auth_token.is_none());
+        assert!(ClientConfig::default().tls);
+        assert!(ClientConfig::default().danger_accept_invalid_certs);
+
+        let registry = Registry::with_config(loopback(), ServerConfig::default())
+            .await
+            .unwrap();
+        let _source = registry.set("default".to_string(), 1usize).await.unwrap();
+
+        let var = SyncedVar::<String>::with_config(registry.addr(), 1usize, ClientConfig::default());
+        eventually(&var, &Some("default".to_string())).await;
     }
 }
