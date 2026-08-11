@@ -13,10 +13,11 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{Router, routing::get};
 use axum_server::tls_rustls::RustlsConfig;
+use parking_lot::Mutex;
 use tokio::net::TcpListener;
-use tokio::sync::{RwLock, watch};
+use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::WatchStream;
+use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, WatchStream};
 use tokio_stream::{Stream, StreamExt};
 
 use crate::{DEFAULT_ADDR, RegistryLabel, Value};
@@ -41,9 +42,54 @@ impl<T: Value> SyncedVarSource<T> {
     }
 }
 
-/// Type-erased view of a source so a single `Registry` can hold vars of differing types.
+/// The authoritative side of a synced *stream*, owned by the server that produced it.
+///
+/// Unlike [`SyncedVarSource`] there is no current value: each [`set`](Self::set) emits one
+/// event to every currently-connected subscriber. Events sent while nobody is subscribed are
+/// dropped, and a slow subscriber that falls more than `cap` events behind skips the gap.
+pub struct SyncedBroadcastSource<T> {
+    tx: broadcast::Sender<T>,
+}
+
+impl<T: Value> SyncedBroadcastSource<T> {
+    fn new(cap: usize) -> Self {
+        let (tx, _) = broadcast::channel(cap);
+        SyncedBroadcastSource { tx }
+    }
+
+    /// Emits `val` to every currently-connected subscriber.
+    pub fn set(&self, val: T) {
+        let _ = self.tx.send(val);
+    }
+
+    /// Number of clients currently connected and receiving this stream's events.
+    pub fn subscriber_count(&self) -> usize {
+        self.tx.receiver_count()
+    }
+}
+
+/// The authoritative side of a synced *stream* fed by a caller-owned [`mpsc::Receiver`].
+///
+/// Single-consumer: the first client to connect takes the receiver and drains it; later
+/// connections (and any reconnect) receive nothing, since an mpsc receiver cannot be
+/// re-subscribed. Events sent before that first client connects are buffered by the channel, not
+/// dropped. Use [`SyncedBroadcastSource`] instead to fan out to multiple clients.
+pub struct SyncedReceiverSource<T> {
+    rx: Mutex<Option<mpsc::Receiver<T>>>,
+}
+
+impl<T: Value> SyncedReceiverSource<T> {
+    fn new(rx: mpsc::Receiver<T>) -> Self {
+        SyncedReceiverSource {
+            rx: Mutex::new(Some(rx)),
+        }
+    }
+}
+
+/// Type-erased view of a source so a single `Registry` can hold sources of differing types.
 trait ErasedSource: Send + Sync {
-    /// Encoded payloads: the current value first, then one per change.
+    /// Encoded payloads, one per frame: a var replays its current value then each change; a
+    /// broadcast source yields each event sent while subscribed.
     fn encoded_stream(&self) -> Pin<Box<dyn Stream<Item = Vec<u8>> + Send>>;
 }
 
@@ -61,7 +107,52 @@ impl<T: Value> ErasedSource for SyncedVarSource<T> {
     }
 }
 
+impl<T: Value> ErasedSource for SyncedBroadcastSource<T> {
+    fn encoded_stream(&self) -> Pin<Box<dyn Stream<Item = Vec<u8>> + Send>> {
+        Box::pin(BroadcastStream::new(self.tx.subscribe()).filter_map(|v| {
+            let val = match v {
+                Ok(val) => val,
+                Err(e) => {
+                    log::warn!("broadcast subscriber lagged: {e}");
+                    return None;
+                }
+            };
+            match val.encode() {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    log::warn!("failed to encode synced value: {e}");
+                    None
+                }
+            }
+        }))
+    }
+}
+
+impl<T: Value> ErasedSource for SyncedReceiverSource<T> {
+    fn encoded_stream(&self) -> Pin<Box<dyn Stream<Item = Vec<u8>> + Send>> {
+        // The receiver is single-consumer: hand it to the first caller, leave later callers empty.
+        match self.rx.lock().take() {
+            Some(rx) => Box::pin(ReceiverStream::new(rx).filter_map(|v| match v.encode() {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    log::warn!("failed to encode synced value: {e}");
+                    None
+                }
+            })),
+            None => Box::pin(tokio_stream::iter(std::iter::empty::<Vec<u8>>())),
+        }
+    }
+}
+
 type Vars = Arc<RwLock<HashMap<RegistryLabel, Weak<dyn ErasedSource>>>>;
+type Streams = Arc<RwLock<HashMap<RegistryLabel, Weak<dyn ErasedSource>>>>;
+
+/// Combined router state: variables and streams live in separate id namespaces.
+#[derive(Clone)]
+struct AppState {
+    vars: Vars,
+    streams: Streams,
+}
 
 #[derive(Debug, PartialEq)]
 pub enum SetError {
@@ -80,6 +171,7 @@ impl std::error::Error for SetError {}
 
 pub struct Registry {
     vars: Vars,
+    streams: Streams,
     server: JoinHandle<()>,
     addr: SocketAddr,
 }
@@ -153,13 +245,16 @@ impl Registry {
     pub async fn with_config(addr: SocketAddr, config: ServerConfig) -> io::Result<Self> {
         let ServerConfig { auth_token, tls } = config;
         let vars: Vars = Arc::new(RwLock::new(HashMap::new()));
+        let streams: Streams = Arc::new(RwLock::new(HashMap::new()));
         let listener = std::net::TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
 
-        let mut app = Router::new()
-            .route("/data", get(data))
-            .with_state(vars.clone());
+        let state = AppState {
+            vars: vars.clone(),
+            streams: streams.clone(),
+        };
+        let mut app = Router::new().route("/data", get(data)).with_state(state);
         if let Some(token) = auth_token {
             let token: Arc<str> = Arc::from(token);
             app = app.layer(middleware::from_fn_with_state(token, require_auth));
@@ -187,7 +282,12 @@ impl Registry {
                 })
             }
         };
-        Ok(Registry { vars, server, addr })
+        Ok(Registry {
+            vars,
+            server,
+            addr,
+            streams,
+        })
     }
 
     pub async fn default() -> io::Result<Self> {
@@ -217,6 +317,51 @@ impl Registry {
         vars.insert(id, Arc::downgrade(&erased));
         Ok(var)
     }
+
+    /// Registers a new broadcast stream and returns the owning handle. `cap` bounds the
+    /// per-subscriber buffer: a subscriber lagging more than `cap` events behind skips the gap.
+    /// The registry keeps only a `Weak` reference, so the returned handle's lifetime governs
+    /// the stream. Streams and variables occupy separate id namespaces.
+    #[must_use = "dropping the returned handle immediately removes the stream"]
+    pub async fn stream<T: Value>(
+        &self,
+        id: impl Into<RegistryLabel>,
+        cap: usize,
+    ) -> Result<Arc<SyncedBroadcastSource<T>>, SetError> {
+        let id = id.into();
+        let mut streams = self.streams.write().await;
+        streams.retain(|_, weak| weak.strong_count() > 0);
+        if streams.contains_key(&id) {
+            return Err(SetError::IdTaken);
+        }
+        let src = Arc::new(SyncedBroadcastSource::new(cap));
+        let erased: Arc<dyn ErasedSource> = src.clone();
+        streams.insert(id, Arc::downgrade(&erased));
+        Ok(src)
+    }
+
+    /// Registers a stream fed by a caller-owned [`mpsc::Receiver`] and returns the owning handle.
+    /// The caller keeps the paired [`mpsc::Sender`] to emit events. Single-consumer: the first
+    /// client to connect drains the receiver (see [`SyncedReceiverSource`]). The registry keeps
+    /// only a `Weak` reference, so the returned handle's lifetime governs the stream. Streams and
+    /// variables occupy separate id namespaces.
+    #[must_use = "dropping the returned handle immediately removes the stream"]
+    pub async fn stream_from<T: Value>(
+        &self,
+        rx: mpsc::Receiver<T>,
+        id: impl Into<RegistryLabel>,
+    ) -> Result<Arc<SyncedReceiverSource<T>>, SetError> {
+        let id = id.into();
+        let mut streams = self.streams.write().await;
+        streams.retain(|_, weak| weak.strong_count() > 0);
+        if streams.contains_key(&id) {
+            return Err(SetError::IdTaken);
+        }
+        let src = Arc::new(SyncedReceiverSource::new(rx));
+        let erased: Arc<dyn ErasedSource> = src.clone();
+        streams.insert(id, Arc::downgrade(&erased));
+        Ok(src)
+    }
 }
 
 impl Drop for Registry {
@@ -241,9 +386,23 @@ impl DataParams {
     }
 }
 
-async fn data(State(vars): State<Vars>, Query(params): Query<DataParams>) -> impl IntoResponse {
+async fn data(
+    State(state): State<AppState>,
+    Query(params): Query<DataParams>,
+) -> impl IntoResponse {
     let source = match params.label() {
-        Some(label) => vars.read().await.get(&label).and_then(Weak::upgrade),
+        Some(label) => {
+            let var = state.vars.read().await.get(&label).and_then(Weak::upgrade);
+            match var {
+                Some(var) => Some(var),
+                None => state
+                    .streams
+                    .read()
+                    .await
+                    .get(&label)
+                    .and_then(Weak::upgrade),
+            }
+        }
         None => None,
     };
     let stream: Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>> = match source {

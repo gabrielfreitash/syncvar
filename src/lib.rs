@@ -103,8 +103,8 @@ mod tests {
     use std::time::Duration;
 
     use super::Value;
-    use crate::client::{ClientConfig, SyncedVar};
-    use crate::server::{Registry, ServerConfig, SetError, Tls};
+    use crate::client::{ClientConfig, SyncedStream, SyncedVar};
+    use crate::server::{Registry, ServerConfig, SetError, SyncedBroadcastSource, Tls};
 
     fn loopback() -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], 0))
@@ -335,5 +335,131 @@ mod tests {
 
         let var = SyncedVar::<String>::with_config(registry.addr(), 1usize, ClientConfig::default());
         eventually(&var, &Some("default".to_string())).await;
+    }
+
+    /// Awaits one stream event, failing the test if none arrives promptly.
+    async fn recv_soon<T: Value>(stream: &mut SyncedStream<T>) -> Option<T> {
+        tokio::time::timeout(Duration::from_secs(2), stream.recv())
+            .await
+            .expect("timed out waiting for stream event")
+    }
+
+    /// Waits until at least `n` clients are connected to a broadcast source. A broadcast source
+    /// has no value to replay, so events emitted before a subscriber connects are lost; tests
+    /// must confirm the subscriber before emitting.
+    async fn wait_subscribers<T: Value>(source: &SyncedBroadcastSource<T>, n: usize) {
+        for _ in 0..200 {
+            if source.subscriber_count() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("expected {n} subscribers, saw {}", source.subscriber_count());
+    }
+
+    #[tokio::test]
+    async fn stream_delivers_events_in_order() {
+        let registry = Registry::new(loopback()).await.unwrap();
+        let source = registry.stream::<i32>(1usize, 16).await.unwrap();
+
+        let mut stream = SyncedStream::<i32>::new(registry.addr(), 1usize);
+        wait_subscribers(&source, 1).await;
+
+        source.set(1);
+        source.set(2);
+        source.set(3);
+
+        assert_eq!(recv_soon(&mut stream).await, Some(1));
+        assert_eq!(recv_soon(&mut stream).await, Some(2));
+        assert_eq!(recv_soon(&mut stream).await, Some(3));
+    }
+
+    #[tokio::test]
+    async fn stream_reaches_multiple_subscribers() {
+        let registry = Registry::new(loopback()).await.unwrap();
+        let source = registry.stream::<String>(1usize, 16).await.unwrap();
+
+        let mut a = SyncedStream::<String>::new(registry.addr(), 1usize);
+        let mut b = SyncedStream::<String>::new(registry.addr(), 1usize);
+        wait_subscribers(&source, 2).await;
+
+        source.set("hi".to_string());
+        assert_eq!(recv_soon(&mut a).await, Some("hi".to_string()));
+        assert_eq!(recv_soon(&mut b).await, Some("hi".to_string()));
+    }
+
+    #[tokio::test]
+    async fn stream_rejects_taken_id() {
+        let registry = Registry::new(loopback()).await.unwrap();
+        let _first = registry.stream::<i32>(1usize, 8).await.unwrap();
+        let err = registry.stream::<i32>(1usize, 8).await;
+        assert_eq!(err.err(), Some(SetError::IdTaken));
+    }
+
+    #[tokio::test]
+    async fn stream_reuses_dropped_id() {
+        let registry = Registry::new(loopback()).await.unwrap();
+        drop(registry.stream::<i32>(1usize, 8).await.unwrap());
+        let reused = registry.stream::<i32>(1usize, 8).await;
+        assert!(reused.is_ok());
+    }
+
+    #[tokio::test]
+    async fn var_and_stream_coexist() {
+        let registry = Registry::new(loopback()).await.unwrap();
+        let var_src = registry.set("v".to_string(), 1usize).await.unwrap();
+        let stream_src = registry.stream::<i32>(2usize, 16).await.unwrap();
+
+        let var = SyncedVar::<String>::new(registry.addr(), 1usize);
+        eventually(&var, &Some("v".to_string())).await;
+
+        let mut stream = SyncedStream::<i32>::new(registry.addr(), 2usize);
+        wait_subscribers(&stream_src, 1).await;
+        stream_src.set(42);
+        assert_eq!(recv_soon(&mut stream).await, Some(42));
+
+        assert_eq!(var_src.get(), "v");
+    }
+
+    #[tokio::test]
+    async fn receiver_stream_delivers_buffered_events() {
+        let registry = Registry::new(loopback()).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<i32>(16);
+        // A receiver source buffers events until its consumer connects, so emit before connecting.
+        tx.send(1).await.unwrap();
+        tx.send(2).await.unwrap();
+        tx.send(3).await.unwrap();
+        let _handle = registry.stream_from(rx, 1usize).await.unwrap();
+
+        let mut stream = SyncedStream::<i32>::new(registry.addr(), 1usize);
+        assert_eq!(recv_soon(&mut stream).await, Some(1));
+        assert_eq!(recv_soon(&mut stream).await, Some(2));
+        assert_eq!(recv_soon(&mut stream).await, Some(3));
+    }
+
+    #[tokio::test]
+    async fn receiver_stream_is_single_consumer() {
+        let registry = Registry::new(loopback()).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<i32>(16);
+        let _handle = registry.stream_from(rx, 1usize).await.unwrap();
+
+        tx.send(1).await.unwrap();
+        let mut first = SyncedStream::<i32>::new(registry.addr(), 1usize);
+        assert_eq!(recv_soon(&mut first).await, Some(1));
+
+        // The receiver was taken by the first connection; a second client gets nothing.
+        let mut second = SyncedStream::<i32>::new(registry.addr(), 1usize);
+        let got = tokio::time::timeout(Duration::from_millis(300), second.recv()).await;
+        assert!(got.is_err(), "second consumer should receive no events");
+    }
+
+    #[tokio::test]
+    async fn stream_from_rejects_taken_id() {
+        let registry = Registry::new(loopback()).await.unwrap();
+        let (_tx, rx) = tokio::sync::mpsc::channel::<i32>(4);
+        let _first = registry.stream_from(rx, 1usize).await.unwrap();
+        let (_tx2, rx2) = tokio::sync::mpsc::channel::<i32>(4);
+        let err = registry.stream_from(rx2, 1usize).await;
+        assert_eq!(err.err(), Some(SetError::IdTaken));
     }
 }

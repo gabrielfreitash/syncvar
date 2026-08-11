@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
@@ -19,7 +19,7 @@ pub struct SyncedVar<T> {
     task: JoinHandle<()>,
 }
 
-/// Connection options for a [`SyncedVar`].
+/// Connection options for a [`SyncedVar`] or [`SyncedStream`].
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
     /// Bearer token sent with every request. `None` sends no `Authorization` header.
@@ -54,7 +54,7 @@ impl<T: Value> SyncedVar<T> {
         config: ClientConfig,
     ) -> Self {
         let (tx, value) = watch::channel(None);
-        let task = tokio::spawn(receive_loop::<T>(source, id.into(), config, tx));
+        let task = tokio::spawn(receive_loop::<T, _>(source, id.into(), config, tx));
         SyncedVar { value, task }
     }
 
@@ -79,11 +79,89 @@ impl<T> Drop for SyncedVar<T> {
     }
 }
 
-async fn receive_loop<T: Value>(
+/// The receiving side of a synced stream, living on a client that mirrors a remote stream source.
+///
+/// Unlike [`SyncedVar`], which keeps only the latest value, this delivers every event the source
+/// emits, in order, via [`recv`](Self::recv). The background connection reconnects with backoff.
+/// A broadcast source ([`SyncedBroadcastSource`](crate::server::SyncedBroadcastSource)) drops
+/// events emitted while no client is connected; a receiver source
+/// ([`stream_from`](crate::server::Registry::stream_from)) buffers them until its single consumer
+/// connects.
+pub struct SyncedStream<T> {
+    events: mpsc::UnboundedReceiver<T>,
+    task: JoinHandle<()>,
+}
+
+impl<T: Value> SyncedStream<T> {
+    pub fn new(source: SocketAddr, id: impl Into<RegistryLabel>) -> Self {
+        SyncedStream::with_config(source, id, ClientConfig::default())
+    }
+
+    /// Like [`new`](Self::new) but with explicit auth and TLS options.
+    pub fn with_config(
+        source: SocketAddr,
+        id: impl Into<RegistryLabel>,
+        config: ClientConfig,
+    ) -> Self {
+        let (tx, events) = mpsc::unbounded_channel();
+        let task = tokio::spawn(receive_loop::<T, _>(source, id.into(), config, tx));
+        SyncedStream { events, task }
+    }
+
+    pub fn default(id: impl Into<RegistryLabel>) -> Self {
+        SyncedStream::new(DEFAULT_ADDR, id)
+    }
+
+    /// Awaits the next event. Returns `None` only if the background connection task has ended.
+    pub async fn recv(&mut self) -> Option<T> {
+        self.events.recv().await
+    }
+
+    /// Returns the next buffered event without waiting, or `None` if none is ready.
+    pub fn try_recv(&mut self) -> Option<T> {
+        self.events.try_recv().ok()
+    }
+}
+
+impl<T> Drop for SyncedStream<T> {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// A destination for decoded values, abstracting the latest-value [`SyncedVar`] (a `watch`
+/// channel) from the every-event [`SyncedStream`] (an `mpsc` channel) so both share one
+/// connection [`receive_loop`].
+trait Sink<T>: Send + Sync {
+    /// Delivers one value, returning `false` if the receiver has been dropped.
+    fn deliver(&self, val: T) -> bool;
+    /// Whether the receiving handle has been dropped.
+    fn is_closed(&self) -> bool;
+}
+
+impl<T: Value> Sink<T> for watch::Sender<Option<T>> {
+    fn deliver(&self, val: T) -> bool {
+        self.send(Some(val)).is_ok()
+    }
+    fn is_closed(&self) -> bool {
+        watch::Sender::is_closed(self)
+    }
+}
+
+impl<T: Value> Sink<T> for mpsc::UnboundedSender<T> {
+    fn deliver(&self, val: T) -> bool {
+        self.send(val).is_ok()
+    }
+    fn is_closed(&self) -> bool {
+        mpsc::UnboundedSender::is_closed(self)
+    }
+}
+
+async fn receive_loop<T: Value, S: Sink<T> + 'static>(
     source: SocketAddr,
     id: RegistryLabel,
     config: ClientConfig,
-    tx: watch::Sender<Option<T>>,
+    tx: S,
 ) {
     if config.tls {
         crate::install_crypto_provider();
@@ -103,7 +181,7 @@ async fn receive_loop<T: Value>(
     };
     let mut backoff = MIN_BACKOFF;
     loop {
-        match stream_once::<T>(&client, source, &id, &config, &tx).await {
+        match stream_once::<T, S>(&client, source, &id, &config, &tx).await {
             Ok(true) => backoff = MIN_BACKOFF,
             Ok(false) => {}
             Err(e) => log::warn!("sync stream to {source} disconnected: {e}"),
@@ -117,12 +195,12 @@ async fn receive_loop<T: Value>(
 }
 
 /// Streams one connection's worth of frames. Returns whether any value was received.
-async fn stream_once<T: Value>(
+async fn stream_once<T: Value, S: Sink<T>>(
     client: &reqwest::Client,
     source: SocketAddr,
     id: &RegistryLabel,
     config: &ClientConfig,
-    tx: &watch::Sender<Option<T>>,
+    tx: &S,
 ) -> reqwest::Result<bool> {
     let scheme = if config.tls { "https" } else { "http" };
     let mut req = client.get(format!("{scheme}://{source}/data")).query(&[id.query()]);
@@ -139,7 +217,7 @@ async fn stream_once<T: Value>(
             match T::decode(&frame) {
                 Some(val) => {
                     received = true;
-                    if tx.send(Some(val)).is_err() {
+                    if !tx.deliver(val) {
                         return Ok(received);
                     }
                 }
