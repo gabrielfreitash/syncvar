@@ -462,4 +462,21 @@ mod tests {
         let err = registry.stream_from(rx2, 1usize).await;
         assert_eq!(err.err(), Some(SetError::IdTaken));
     }
+
+    #[tokio::test]
+    async fn plain_http_syncs_without_tls() {
+        let config = ServerConfig {
+            tls: None,
+            ..Default::default()
+        };
+        let registry = Registry::with_config(loopback(), config).await.unwrap();
+        let _source = registry.set("cleartext".to_string(), 1usize).await.unwrap();
+
+        let client = ClientConfig {
+            tls: false,
+            ..Default::default()
+        };
+        let var = SyncedVar::<String>::with_config(registry.addr(), 1usize, client);
+        eventually(&var, &Some("cleartext".to_string())).await;
+    }
 }
